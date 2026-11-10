@@ -971,6 +971,60 @@ class ConnectionTests(unittest.TestCase):
                               exceptions.FrameTooLargeError)
         self.assertIn('host=', repr(self.connection._error))
 
+    def _register_real_channel(self, channel_number):
+        real_channel = channel.Channel(self.connection, channel_number, None)
+        real_channel._set_state(channel.Channel.OPEN)
+        self.connection._channels[channel_number] = real_channel
+        return real_channel
+
+    def test_legal_content_stream_is_delivered_through_frame_loop(self):
+        real_channel = self._register_real_channel(1)
+        consumer = mock.Mock()
+        real_channel._consumers['ctag'] = consumer
+        deliver = frame.Method(
+            1,
+            spec.Basic.Deliver('ctag', 5, exchange='', routing_key='q')).marshal()
+        header = frame.Header(
+            1, 5,
+            spec.BasicProperties(correlation_id='wire')).marshal()
+        body_one = frame.Body(1, b'hel').marshal()
+        body_two = frame.Body(1, b'lo').marshal()
+
+        self._feed_with_real_terminate(deliver + header + body_one + body_two)
+
+        self.assertIsNone(self.connection._error)
+        self.assertEqual(1, consumer.call_count)
+        _channel, method, properties, body = consumer.call_args[0]
+        self.assertEqual(method.delivery_tag, 5)
+        self.assertEqual(properties.correlation_id, 'wire')
+        self.assertEqual(body, b'hello')
+
+    def test_out_of_sequence_content_frame_terminates_the_connection(self):
+        real_channel = self._register_real_channel(1)
+        consumer = mock.Mock()
+        real_channel._consumers['ctag'] = consumer
+        deliver = frame.Method(
+            1,
+            spec.Basic.Deliver('ctag', 1, exchange='', routing_key='q')).marshal()
+        header = frame.Header(1, 6, spec.BasicProperties()).marshal()
+        partial_body = frame.Body(1, b'abc').marshal()
+        # A second Deliver arrives while the first message's body is incomplete.
+        second_deliver = frame.Method(
+            1,
+            spec.Basic.Deliver('ctag', 2, exchange='', routing_key='q')).marshal()
+
+        self._feed_with_real_terminate(
+            deliver + header + partial_body + second_deliver)
+
+        self.assertIsInstance(self.connection._error,
+                              exceptions.UnexpectedFrameError)
+        consumer.assert_not_called()
+        self.assertEqual(
+            real_channel._content_assembler._state,
+            channel.ContentFrameAssembler.AWAIT_METHOD)
+        self.assertEqual(
+            real_channel._content_assembler._body_fragments, [])
+
     def test_add_on_connection_blocked_callback(self):
         blocked_buffer = []
         self.connection.add_on_connection_blocked_callback(

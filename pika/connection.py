@@ -2203,6 +2203,14 @@ class Connection(abc.ABC):
                     LOGGER.error('%r', error)
                     self._terminate_stream(error)
                     return
+                except exceptions.ProtocolSyntaxError as error:
+                    # An out-of-sequence content frame (or other protocol
+                    # syntax violation) cannot be recovered from without mixing
+                    # messages, so end the connection the same way as a size
+                    # error instead of letting the exception escape the loop.
+                    LOGGER.error('%r', error)
+                    self._terminate_stream(error)
+                    return
                 if self._frame_buffer is not buffer:
                     # A frame callback reset the connection state (e.g. stream
                     # terminated); leftover data is no longer relevant.

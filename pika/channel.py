@@ -9,7 +9,7 @@ import logging
 import uuid
 from collections import deque
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Union
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Union, cast
 
 from pika import exceptions, frame, spec, validators
 from pika._utils import as_bytes, override
@@ -1254,15 +1254,13 @@ class Channel:
         content delivery.
 
         The _content_assembler will be invoked which will return the fully formed message in three
-        parts when all of the body frames have been received.
+        parts when all of the body frames have been received. Out-of-sequence frames raise a
+        `ProtocolSyntaxError`, which propagates to the connection's frame loop so the protocol
+        violation tears the connection down instead of mixing two messages together.
 
         :param frame_value: The frame to deliver
         """
-        try:
-            response = self._content_assembler.process(frame_value)
-        except exceptions.UnexpectedFrameError:
-            self._on_unexpected_frame(frame_value)
-            return
+        response = self._content_assembler.process(frame_value)
 
         if response:
             method_index = response[0].method.INDEX
@@ -1724,22 +1722,29 @@ class Channel:
         """
         self._state = connection_state
 
-    def _on_unexpected_frame(self, frame_value: frame.Frame) -> None:
-        """
-        Invoked when a frame is received that is not setup to be processed.
-
-        :param frame_value: The frame received
-        """
-        LOGGER.error('Unexpected frame: %r', frame_value)
-
 
 class ContentFrameAssembler:
-    """Handle content related frames, building a message and return the message back in three parts
-    upon receipt.
+    """Assemble the method, header and body frames of one content message.
+
+    Frames must arrive in AMQP 0-9-1 order: one content method frame, one
+    content header frame, then body frames carrying exactly the declared body
+    size. The order is enforced as an explicit state machine so a frame from a
+    different message can never overwrite or extend the one being assembled.
+    Any out-of-sequence frame raises a `ProtocolSyntaxError`, which propagates
+    through the connection's frame loop and tears the connection down, and the
+    partially buffered fragments are released first.
     """
+
+    # No method frame of the current message has been seen yet.
+    AWAIT_METHOD = 0
+    # The method frame has been seen; the header frame is next.
+    AWAIT_HEADER = 1
+    # The header frame has been seen; body frames are next.
+    AWAIT_BODY = 2
 
     def __init__(self) -> None:
         """Create a new instance of the content frame assembler."""
+        self._state = self.AWAIT_METHOD
         self._method_frame: frame.Method | None = None
         self._header_frame: frame.Header | None = None
         self._seen_so_far = 0
@@ -1754,56 +1759,93 @@ class ContentFrameAssembler:
         Basic.Return.
 
         :param frame_value: The frame to process
+        :raises pika.exceptions.UnexpectedFrameError: if the frame is not a content method, header
+            or body frame, or if it arrives out of the method-header-body sequence
+        :raises pika.exceptions.BodyTooLongError: if body frames carry more bytes than the header
+            frame declared
         """
         frame_type = frame_value.frame_type
         if frame_type == spec.FRAME_METHOD:
-            assert isinstance(frame_value, frame.Method)
-            if spec.has_content(frame_value.method.INDEX):
-                self._method_frame = frame_value
-                return None
-        elif frame_type == spec.FRAME_HEADER:
-            assert isinstance(frame_value, frame.Header)
-            self._header_frame = frame_value
-            if frame_value.body_size == 0:
-                return self._finish()
-            return None
-        elif frame_type == spec.FRAME_BODY:
-            assert isinstance(frame_value, frame.Body)
-            return self._handle_body_frame(frame_value)
+            return self._process_method(frame_value)
+        if frame_type == spec.FRAME_HEADER:
+            return self._process_header(frame_value)
+        if frame_type == spec.FRAME_BODY:
+            return self._process_body(frame_value)
+        raise exceptions.UnexpectedFrameError(frame_value)
+
+    def _process_method(
+        self, frame_value: frame.Frame
+    ) -> tuple[frame.Method, frame.Header, bytes] | None:
+        if not isinstance(frame_value, frame.Method):
+            raise exceptions.UnexpectedFrameError(frame_value)
+        if self._state != self.AWAIT_METHOD:
+            self._reject(frame_value, 'a content method frame while another '
+                         'message is still being assembled')
+        if not spec.has_content(frame_value.method.INDEX):
+            raise exceptions.UnexpectedFrameError(frame_value)
+        self._method_frame = frame_value
+        self._state = self.AWAIT_HEADER
+        return None
+
+    def _process_header(
+        self, frame_value: frame.Frame
+    ) -> tuple[frame.Method, frame.Header, bytes] | None:
+        if not isinstance(frame_value, frame.Header):
+            raise exceptions.UnexpectedFrameError(frame_value)
+        if self._state != self.AWAIT_HEADER:
+            self._reject(frame_value, 'a content header frame without a '
+                         'preceding content method frame')
+        self._header_frame = frame_value
+        if frame_value.body_size == 0:
+            return self._finish()
+        self._state = self.AWAIT_BODY
+        return None
+
+    def _process_body(
+        self, frame_value: frame.Frame
+    ) -> tuple[frame.Method, frame.Header, bytes] | None:
+        if not isinstance(frame_value, frame.Body):
+            raise exceptions.UnexpectedFrameError(frame_value)
+        if self._state != self.AWAIT_BODY:
+            self._reject(frame_value, 'a content body frame before the '
+                         'content header frame')
+        if len(frame_value.fragment) == 0:
+            self._reject(frame_value, 'a zero-length content body frame')
+        self._seen_so_far += len(frame_value.fragment)
+        self._body_fragments.append(frame_value.fragment)
+        declared_size = cast(frame.Header, self._header_frame).body_size
+        seen_so_far = self._seen_so_far
+        if seen_so_far > declared_size:
+            # Release the buffered fragments before raising so the oversized
+            # message cannot be delivered from stale state on the next frame.
+            self._reset()
+            raise exceptions.BodyTooLongError(seen_so_far, declared_size)
+        if seen_so_far == declared_size:
+            return self._finish()
+        return None
+
+    def _reject(self, frame_value: frame.Frame, reason: str) -> None:
+        """Raise for an out-of-sequence frame after releasing buffered data."""
+        LOGGER.error(
+            'Rejecting out-of-sequence content frame (%s); discarding the '
+            'partially assembled message: %r', reason, frame_value)
+        self._reset()
         raise exceptions.UnexpectedFrameError(frame_value)
 
     def _finish(self) -> tuple[frame.Method, frame.Header, bytes]:
         """Invoked when all of the message has been received."""
-        assert self._method_frame is not None
-        assert self._header_frame is not None
-        content = (self._method_frame, self._header_frame,
+        # The state machine only reaches _finish() after a content method and
+        # header frame have been stored; the casts record that invariant
+        # without an assert that Python could run with -O.
+        content = (cast(frame.Method, self._method_frame),
+                   cast(frame.Header, self._header_frame),
                    b''.join(self._body_fragments))
         self._reset()
         return content
 
-    def _handle_body_frame(
-        self, body_frame: frame.Body
-    ) -> tuple[frame.Method, frame.Header, bytes] | None:
-        """
-        Receive body frames and append them to the stack.
-
-        When the body size matches, call the finish method.
-
-        :param body_frame: The body frame
-        :raises: pika.exceptions.BodyTooLongError
-        """
-        self._seen_so_far += len(body_frame.fragment)
-        self._body_fragments.append(body_frame.fragment)
-        assert self._header_frame is not None
-        if self._seen_so_far == self._header_frame.body_size:
-            return self._finish()
-        if self._seen_so_far > self._header_frame.body_size:
-            raise exceptions.BodyTooLongError(self._seen_so_far,
-                                              self._header_frame.body_size)
-        return None
-
     def _reset(self) -> None:
         """Reset the values for processing frames."""
+        self._state = self.AWAIT_METHOD
         self._method_frame = None
         self._header_frame = None
         self._seen_so_far = 0

@@ -1614,6 +1614,8 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(self.obj._content_assembler._method_frame, frame_value)
 
     def test_handle_content_frame_sets_header_frame(self):
+        self.obj._handle_content_frame(
+            frame.Method(1, spec.Basic.Deliver('ctag0', 1)))
         frame_value = frame.Header(1, 10, spec.BasicProperties())
         self.obj._handle_content_frame(frame_value)
         self.assertEqual(self.obj._content_assembler._header_frame, frame_value)
@@ -2125,3 +2127,217 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(send_method_mock.call_count, 1)
         self.assertIsNone(self.obj._blocking)
         self.assertEqual(cb_add_mock.call_count, 0)
+
+
+class ChannelContentFrameStateMachineTests(unittest.TestCase):
+    """Drive a real Channel's assembler with hand-built content frames.
+
+    Every delivery is checked for the method, properties and body belonging to
+    the same message, and every illegal transition must surface as a protocol
+    error after the buffered fragments are released.
+    """
+
+    def setUp(self):
+        self.connection = ChannelTests._create_connection()
+        self.connection.accept_consumer_cancel_ok = False
+        self.channel = channel.Channel(self.connection, 1, mock.Mock())
+        self.channel._set_state(channel.Channel.OPEN)
+        self.channel._consumers['ctag0'] = mock.Mock()
+        self.channel._consumers['ctag1'] = mock.Mock()
+
+    def _deliver(self, tag, channel_number=1, consumer_tag='ctag0'):
+        return frame.Method(
+            channel_number,
+            spec.Basic.Deliver(consumer_tag=consumer_tag,
+                               delivery_tag=tag))
+
+    @staticmethod
+    def _header(channel_number=1, body_size=6, correlation_id=None):
+        properties = (spec.BasicProperties(correlation_id=correlation_id)
+                      if correlation_id else spec.BasicProperties())
+        return frame.Header(channel_number, body_size, properties)
+
+    @staticmethod
+    def _body(channel_number=1, fragment=b'abc123'):
+        return frame.Body(channel_number, fragment)
+
+    def _feed(self, frames):
+        for value in frames:
+            self.channel._handle_content_frame(value)
+
+    def _only_delivery(self):
+        self.assertEqual(1, self.channel._consumers['ctag0'].call_count)
+        _channel, method, properties, body = (
+            self.channel._consumers['ctag0'].call_args[0])
+        return method, properties, body
+
+    def test_split_body_is_delivered_as_one_message(self):
+        self._feed([
+            self._deliver(1),
+            self._header(body_size=6, correlation_id='split'),
+            self._body(fragment=b'abc'),
+            self._body(fragment=b'123'),
+        ])
+        method, properties, body = self._only_delivery()
+        self.assertEqual(method.delivery_tag, 1)
+        self.assertEqual(properties.correlation_id, 'split')
+        self.assertEqual(body, b'abc123')
+
+    def test_two_messages_keep_method_properties_and_body_together(self):
+        self._feed([
+            self._deliver(1),
+            self._header(body_size=3, correlation_id='first'),
+            self._body(fragment=b'one'),
+            self._deliver(2),
+            self._header(body_size=4, correlation_id='second'),
+            self._body(fragment=b'four'),
+        ])
+        consumer = self.channel._consumers['ctag0']
+        self.assertEqual(2, consumer.call_count)
+        _c1, first_method, first_props, first_body = consumer.call_args_list[0][0]
+        _c2, second_method, second_props, second_body = consumer.call_args_list[1][0]
+        self.assertEqual((1, 'first', b'one'),
+                         (first_method.delivery_tag,
+                          first_props.correlation_id, first_body))
+        self.assertEqual((2, 'second', b'four'),
+                         (second_method.delivery_tag,
+                          second_props.correlation_id, second_body))
+
+    def test_two_channels_interleave_without_mixing_fragments(self):
+        other = channel.Channel(self.connection, 2, mock.Mock())
+        other._set_state(channel.Channel.OPEN)
+        other._consumers['ctag1'] = mock.Mock()
+
+        self.channel._handle_content_frame(self._deliver(1))
+        self.channel._handle_content_frame(
+            self._header(body_size=5, correlation_id='ch1'))
+        other._handle_content_frame(
+            self._deliver(2, channel_number=2, consumer_tag='ctag1'))
+        other._handle_content_frame(
+            self._header(channel_number=2,
+                         body_size=5,
+                         correlation_id='ch2'))
+        self.channel._handle_content_frame(self._body(fragment=b'hello'))
+        other._handle_content_frame(
+            self._body(channel_number=2, fragment=b'world'))
+
+        method, properties, body = self._only_delivery()
+        self.assertEqual((1, 'ch1', b'hello'),
+                         (method.delivery_tag, properties.correlation_id,
+                          body))
+        _other_channel, other_method, other_props, other_body = other._consumers[
+            'ctag1'].call_args[0]
+        self.assertEqual((2, 'ch2', b'world'),
+                         (other_method.delivery_tag,
+                          other_props.correlation_id, other_body))
+
+    def test_consecutive_zero_length_messages_are_delivered_with_empty_bodies(
+            self):
+        self._feed([
+            self._deliver(1),
+            self._header(body_size=0, correlation_id='empty-1'),
+            self._deliver(2),
+            self._header(body_size=0, correlation_id='empty-2'),
+        ])
+        consumer = self.channel._consumers['ctag0']
+        self.assertEqual(2, consumer.call_count)
+        _c1, first_method, first_props, first_body = consumer.call_args_list[0][0]
+        _c2, second_method, second_props, second_body = consumer.call_args_list[1][0]
+        self.assertEqual((1, 'empty-1', b''),
+                         (first_method.delivery_tag,
+                          first_props.correlation_id, first_body))
+        self.assertEqual((2, 'empty-2', b''),
+                         (second_method.delivery_tag,
+                          second_props.correlation_id, second_body))
+
+    def test_getok_delivery_uses_getok_callback_with_matching_parts(self):
+        callback = mock.Mock()
+        self.channel._on_getok_callback = callback
+        method_value = frame.Method(1, spec.Basic.GetOk('ctag0', True))
+        header_value = self._header(body_size=2, correlation_id='get')
+        self._feed(
+            [method_value, header_value,
+             self._body(fragment=b'ok')])
+        _channel, method, properties, body = callback.call_args[0]
+        self.assertIs(method, method_value.method)
+        self.assertEqual(properties.correlation_id, 'get')
+        self.assertEqual(body, b'ok')
+
+    def assert_protocol_error_resets_assembler(self, frames):
+        with self.assertRaises(exceptions.ProtocolSyntaxError):
+            self._feed(frames)
+        assembler = self.channel._content_assembler
+        self.assertEqual(assembler._state,
+                         channel.ContentFrameAssembler.AWAIT_METHOD)
+        self.assertIsNone(assembler._method_frame)
+        self.assertIsNone(assembler._header_frame)
+        self.assertEqual(assembler._seen_so_far, 0)
+        self.assertEqual(assembler._body_fragments, [])
+        self.channel._consumers['ctag0'].assert_not_called()
+
+    def test_method_mid_body_is_rejected_and_not_delivered(self):
+        self.assert_protocol_error_resets_assembler([
+            self._deliver(1),
+            self._header(body_size=6),
+            self._body(fragment=b'abc'),
+            self._deliver(2),
+        ])
+
+    def test_duplicate_header_is_rejected(self):
+        self.assert_protocol_error_resets_assembler([
+            self._deliver(1),
+            self._header(body_size=6),
+            self._header(body_size=6),
+        ])
+
+    def test_body_without_header_is_rejected(self):
+        self.assert_protocol_error_resets_assembler(
+            [self._deliver(1),
+             self._body(fragment=b'abc')])
+
+    def test_header_without_method_is_rejected(self):
+        self.assert_protocol_error_resets_assembler([self._header(body_size=6)])
+
+    def test_body_without_anything_is_rejected(self):
+        self.assert_protocol_error_resets_assembler(
+            [self._body(fragment=b'abc')])
+
+    def test_zero_length_body_frame_is_rejected(self):
+        self.assert_protocol_error_resets_assembler([
+            self._deliver(1),
+            self._header(body_size=3),
+            self._body(fragment=b''),
+        ])
+
+    def test_oversized_body_is_rejected_and_fragments_released(self):
+        with self.assertRaises(exceptions.BodyTooLongError) as ctx:
+            self._feed([
+                self._deliver(1),
+                self._header(body_size=3),
+                self._body(fragment=b'ab'),
+                self._body(fragment=b'cd'),
+            ])
+        self.assertEqual(ctx.exception.args, (4, 3))
+        assembler = self.channel._content_assembler
+        self.assertEqual(assembler._state,
+                         channel.ContentFrameAssembler.AWAIT_METHOD)
+        self.assertEqual(assembler._body_fragments, [])
+        self.channel._consumers['ctag0'].assert_not_called()
+
+    def test_non_content_method_is_rejected(self):
+        self.assert_protocol_error_resets_assembler(
+            [frame.Method(1, spec.Basic.Qos())])
+
+    def test_channel_recovers_after_protocol_error(self):
+        with self.assertRaises(exceptions.ProtocolSyntaxError):
+            self.channel._handle_content_frame(
+                self._body(fragment=b'lost'))
+        self._feed([
+            self._deliver(9),
+            self._header(body_size=2, correlation_id='after-error'),
+            self._body(fragment=b'ok'),
+        ])
+        method, properties, body = self._only_delivery()
+        self.assertEqual((9, 'after-error', b'ok'),
+                         (method.delivery_tag, properties.correlation_id,
+                          body))
