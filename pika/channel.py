@@ -718,9 +718,7 @@ class Channel:
         self._closing_reason = exceptions.ChannelClosedByClient(
             reply_code, reply_text)
 
-        for consumer_tag in list(self._consumers.keys()):
-            if consumer_tag not in self._cancelled:
-                self.basic_cancel(consumer_tag=consumer_tag)
+        self._cancel_all_consumers()
 
         # Change state after cancelling consumers to avoid
         # ChannelWrongStateError exception from basic_cancel
@@ -1191,7 +1189,13 @@ class Channel:
                            only_caller=self)
 
     def _cleanup(self) -> None:
-        """Remove all consumers and any callbacks for the channel."""
+        """Remove all consumers and any callbacks for the channel.
+
+        This is the channel-wide teardown on the transition to CLOSED, not the
+        per-consumer retirement `_cleanup_consumer_ref` performs: every
+        consumer goes at once regardless of its cancel state, including the
+        retained entries of nowait-cancelled ones.
+        """
         self.callbacks.process(self.channel_number,
                                self._ON_CHANNEL_CLEANUP_CB_KEY, self, self)
         self._consumers = {}
@@ -1202,9 +1206,18 @@ class Channel:
 
     def _cleanup_consumer_ref(self, consumer_tag: str) -> None:
         """
-        Remove any references to the consumer tag in internal structures for consumer state.
+        Retire a consumer: detach its callback and cancel reservation for the tag.
 
-        :param consumer_tag: The consumer tag to cleanup
+        This is the single end-of-life transition for a consumer entry. Three
+        paths reach it, each for a different reason, and each retires the same
+        way: `_on_cancelok` after a client-initiated cancel's reply,
+        `_on_cancel` for a broker-initiated cancel with no client cancel in
+        flight, and `_retain_cancelled_tag` when a nowait tag is evicted past
+        the retention cap. Retirement is also what lets `basic_consume` hand
+        the tag to a new consumer, so it must run only once the old consumer
+        can no longer receive a delivery.
+
+        :param consumer_tag: The consumer tag to retire
         """
         self._consumers.pop(consumer_tag, None)
         self._cancelled.discard(consumer_tag)
@@ -1237,6 +1250,20 @@ class Channel:
         self._nowait_cancelled.append(consumer_tag)
         while len(self._nowait_cancelled) > self._MAX_RETAINED_CANCELLED_TAGS:
             self._cleanup_consumer_ref(self._nowait_cancelled.popleft())
+
+    def _cancel_all_consumers(self) -> None:
+        """
+        Ask the broker to cancel every consumer not already cancelling.
+
+        A tag in `_cancelled` has a cancel in flight, so a second nowait one
+        would do nothing but log; the retained entries of nowait-cancelled
+        consumers stay put until their retention lapses or the channel is
+        cleaned up. Used by `close`, whose own docstring states what happens to
+        deliveries the broker keeps dispatching.
+        """
+        for consumer_tag in list(self._consumers.keys()):
+            if consumer_tag not in self._cancelled:
+                self.basic_cancel(consumer_tag=consumer_tag)
 
     def _get_cookie(self) -> Any:
         """

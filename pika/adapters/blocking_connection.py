@@ -1320,7 +1320,7 @@ class BlockingChannel:
         self._connection = connection
 
         # A mapping of consumer tags to _ConsumerInfo for active consumers
-        self._consumer_infos: dict[Any, Any] = {}
+        self._consumer_infos: dict[Any, _ConsumerInfo] = {}
 
         # Queue consumer generator generator info of type
         # _QueueConsumerGeneratorInfo created by BlockingChannel.consume
@@ -1486,6 +1486,34 @@ class BlockingChannel:
         self._pending_events.append(evt)
         self.connection._request_channel_dispatch(self.channel_number)
 
+    def _retire_consumer_info(self, consumer_tag: Any) -> bool:
+        """
+        Detach the wrapper's entry for a consumer, its end-of-life transition.
+
+        Mirrors `Channel._cleanup_consumer_ref` one layer up: the broker-cancel
+        event dispatch, the `basic_cancel` completion and a failed
+        `basic_consume` all end a consumer this way instead of each deleting the
+        mapping themselves.
+
+        :param consumer_tag: The tag whose entry is removed
+        :returns: whether an entry was present
+        """
+        return self._consumer_infos.pop(consumer_tag, None) is not None
+
+    def _consumer_for_event(self, consumer_tag: Any) -> _ConsumerInfo | None:
+        """
+        Resolve the consumer an incoming delivery or cancel event belongs to.
+
+        A tag can be reused only after `basic_cancel` returned, and that call
+        drained the consumer's queued events first, so an event queued for a tag
+        always belongs to the entry currently registered for it. A missing entry
+        means the event outlived its consumer because the channel is tearing
+        down; it is then dropped rather than routed to whatever reuses the tag.
+
+        :param consumer_tag: The tag carried by the incoming event
+        """
+        return self._consumer_infos.get(consumer_tag)
+
     def _on_channel_closed(self, _channel: pika.channel.Channel,
                            reason: Exception) -> None:
         """
@@ -1536,7 +1564,12 @@ class BlockingChannel:
         """
         evt = _ConsumerCancellationEvt(method_frame)
 
-        consumer = self._consumer_infos[method_frame.method.consumer_tag]
+        consumer = self._consumer_for_event(method_frame.method.consumer_tag)
+        if consumer is None:
+            LOGGER.debug(
+                'Ignoring broker cancellation of unknown consumer=%r while '
+                'tearing down', method_frame.method.consumer_tag)
+            return
 
         # Don't interfere with client-initiated cancellation flow
         if not consumer.tearing_down:
@@ -1561,7 +1594,12 @@ class BlockingChannel:
         """
         evt = _ConsumerDeliveryEvt(method, properties, body)
 
-        consumer = self._consumer_infos[method.consumer_tag]
+        consumer = self._consumer_for_event(method.consumer_tag)
+        if consumer is None:
+            LOGGER.debug(
+                'Ignoring delivery to unknown consumer=%r while tearing '
+                'down', method.consumer_tag)
+            return
 
         if consumer.alternate_event_sink is not None:
             consumer.alternate_event_sink(evt)
@@ -1609,12 +1647,21 @@ class BlockingChannel:
             evt = self._pending_events.popleft()
 
             if type(evt) is _ConsumerDeliveryEvt:
-                consumer_info = self._consumer_infos[evt.method.consumer_tag]
+                consumer_info = self._consumer_for_event(
+                    evt.method.consumer_tag)
+                if consumer_info is None:
+                    # The consumer was retired while its event sat queued, e.g.
+                    # the channel is closing; never route it to a consumer that
+                    # reuses the tag.
+                    continue
+                # A queued delivery event comes from basic_consume's callback
+                # path, whose consumers always have an on_message_callback.
+                assert consumer_info.on_message_callback is not None
                 consumer_info.on_message_callback(self, evt.method,
                                                   evt.properties, evt.body)
 
             elif type(evt) is _ConsumerCancellationEvt:
-                del self._consumer_infos[evt.method_frame.method.consumer_tag]
+                self._retire_consumer_info(evt.method_frame.method.consumer_tag)
 
                 self._impl.callbacks.process(self.channel_number,
                                              self._CONSUMER_CANCELLED_CB_KEY,
@@ -1835,8 +1882,7 @@ class BlockingChannel:
                 self._flush_output(ok_result.is_ready)
         except Exception:
             # If channel was closed, self._consumer_infos will be empty
-            if consumer_tag in self._consumer_infos:
-                del self._consumer_infos[consumer_tag]
+            if self._retire_consumer_info(consumer_tag):
                 # Schedule termination of connection.process_data_events using a
                 # negative channel number
                 self.connection._request_channel_dispatch(-self.channel_number)
@@ -1960,8 +2006,7 @@ class BlockingChannel:
             return []
         finally:
             # NOTE: The entry could be purged if channel or connection closes
-            if consumer_tag in self._consumer_infos:
-                del self._consumer_infos[consumer_tag]
+            if self._retire_consumer_info(consumer_tag):
                 # Schedule termination of connection.process_data_events using a
                 # negative channel number
                 self.connection._request_channel_dispatch(-self.channel_number)

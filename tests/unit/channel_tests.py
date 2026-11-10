@@ -623,6 +623,144 @@ class ChannelTests(unittest.TestCase):
 
         later.assert_not_called()
 
+    def _deliver(self, chan, consumer_tag, delivery_tag):
+        method = frame.Method(chan.channel_number,
+                              spec.Basic.Deliver(consumer_tag, delivery_tag))
+        header = frame.Header(chan.channel_number, 0, spec.BasicProperties())
+        chan._on_deliver(method, header, b'body')
+        return method
+
+    def test_reused_tag_after_a_waited_cancel_starts_without_stale_state(self):
+        # A waited cancel retires on the CancelOk before the tag can be reused,
+        # so the new consumer starts from empty bookkeeping rather than from the
+        # old consumer's cancelled/callback state. The wire frames for a reused
+        # tag carry no generation marker, so a delivery that really arrives after
+        # the reuse is the new consumer's; the retire-before-reuse ordering is
+        # what keeps the two lifetimes apart (see basic_cancel's docstring and
+        # the BlockingChannel tests that pin the queued-delivery case).
+        chan = self._real_channel()
+        old_calls = []
+        chan._consumers['ctag-a'] = (lambda *_args: old_calls.append(_args))
+        chan.basic_cancel('ctag-a', callback=mock.Mock())
+        self._process(chan, spec.Basic.CancelOk(consumer_tag='ctag-a'))
+        self.assertNotIn('ctag-a', chan._consumers)
+        self.assertNotIn('ctag-a', chan._cancelled)
+
+        new_callback = mock.Mock()
+        tag = chan.basic_consume('queue', new_callback, consumer_tag='ctag-a')
+
+        self.assertEqual(tag, 'ctag-a')
+        self.assertIs(chan._consumers['ctag-a'], new_callback)
+        self.assertNotIn('ctag-a', chan._cancelled)
+        self.assertEqual(chan.consumer_tags, ['ctag-a'])
+
+    def test_delivery_after_reuse_reaches_the_new_callback_only(self):
+        # Once the tag is reused, a delivery the broker attributes to the new
+        # consumer reaches that callback and never the retired one.
+        chan = self._real_channel()
+        old_calls = []
+        new_calls = []
+        chan._consumers['ctag-a'] = (lambda *_args: old_calls.append(_args))
+        chan.basic_cancel('ctag-a', callback=mock.Mock())
+        self._process(chan, spec.Basic.CancelOk(consumer_tag='ctag-a'))
+
+        new_callback = lambda *_args: new_calls.append(_args)
+        chan.basic_consume('queue', new_callback, consumer_tag='ctag-a')
+        self._deliver(chan, 'ctag-a', 2)
+
+        self.assertEqual(len(new_calls), 1)
+        self.assertEqual(new_calls[0][1].delivery_tag, 2)
+        self.assertIs(new_calls[0][0], chan)
+        self.assertEqual(old_calls, [])
+
+    def test_broker_cancel_retirement_allows_a_clean_reuse(self):
+        # A broker-initiated cancel retires the consumer without a client
+        # Basic.Cancel; the reused tag then starts a fresh entry whose callback
+        # owns the deliveries that arrive after the reuse.
+        chan = self._real_channel()
+        old_calls = []
+        new_calls = []
+        chan._consumers['ctag-a'] = (lambda *_args: old_calls.append(_args))
+
+        broker_cancel = frame.Method(chan.channel_number,
+                                     spec.Basic.Cancel(consumer_tag='ctag-a'))
+        chan._on_cancel(broker_cancel)
+        self.assertNotIn('ctag-a', chan._consumers)
+        self.assertNotIn('ctag-a', chan._cancelled)
+
+        chan.basic_consume('queue',
+                           lambda *_args: new_calls.append(_args),
+                           consumer_tag='ctag-a')
+        self._deliver(chan, 'ctag-a', 2)
+
+        self.assertEqual(old_calls, [])
+        self.assertEqual(len(new_calls), 1)
+        self.assertEqual(new_calls[0][1].delivery_tag, 2)
+
+    def test_deliver_cancel_cancelok_interleaving_keeps_the_old_callback(self):
+        # Deliveries that arrive while a waited cancel is in flight, before and
+        # after the broker's Basic.Cancel frames, still reach the original
+        # callback; only the CancelOk retires the entry.
+        chan = self._real_channel()
+        calls = []
+        chan._consumers['ctag-a'] = (
+            lambda *_args: calls.append(_args[1].delivery_tag))
+
+        self._deliver(chan, 'ctag-a', 1)
+        chan.basic_cancel('ctag-a', callback=mock.Mock())
+        self._deliver(chan, 'ctag-a', 2)
+        broker_cancel = frame.Method(chan.channel_number,
+                                     spec.Basic.Cancel(consumer_tag='ctag-a'))
+        chan._on_cancel(broker_cancel)
+        self._deliver(chan, 'ctag-a', 3)
+        self._process(chan, spec.Basic.CancelOk(consumer_tag='ctag-a'))
+
+        self.assertEqual(calls, [1, 2, 3])
+        self.assertNotIn('ctag-a', chan._consumers)
+
+    def test_callback_may_cancel_its_own_consumer(self):
+        # A delivery callback cancelling its own consumer must not tear the
+        # entry out from under the in-flight dispatch: the callback runs to
+        # completion and the cancel retires on the CancelOk.
+        chan = self._real_channel()
+        on_cancel_ok = mock.Mock()
+
+        def self_cancelling(_channel, method, _properties, _body):
+            _channel.basic_cancel(method.consumer_tag, callback=on_cancel_ok)
+
+        chan._consumers['ctag-a'] = self_cancelling
+        self._deliver(chan, 'ctag-a', 1)
+
+        self.assertIn('ctag-a', chan._cancelled)
+        self.assertIn('ctag-a', chan._consumers)
+        self._process(chan, spec.Basic.CancelOk(consumer_tag='ctag-a'))
+        self.assertNotIn('ctag-a', chan._consumers)
+        on_cancel_ok.assert_called_once()
+
+    def test_nowait_eviction_retirement_allows_a_clean_reuse(self):
+        # After the retention cap evicts a nowait-cancelled tag, reusing it
+        # registers a new callback on clean bookkeeping; deliveries that then
+        # arrive are the new consumer's. The docstring of basic_cancel states
+        # the residual case this does not cover: a delivery the broker had
+        # already dispatched for the old lifetime, which the wire cannot mark.
+        chan = self._real_channel()
+        chan._MAX_RETAINED_CANCELLED_TAGS = 1
+        new_calls = []
+        chan._consumers['old'] = logging.debug
+        chan.basic_cancel('old')
+        chan._consumers['other'] = logging.debug
+        chan.basic_cancel('other')
+        self.assertNotIn('old', chan._consumers)
+        self.assertNotIn('old', chan._cancelled)
+
+        new_callback = lambda *_args: new_calls.append(_args)
+        chan.basic_consume('queue', new_callback, consumer_tag='old')
+        self.assertIs(chan._consumers['old'], new_callback)
+        self._deliver(chan, 'old', 9)
+
+        self.assertEqual(len(new_calls), 1)
+        self.assertEqual(new_calls[0][1].delivery_tag, 9)
+
     def test_basic_consume_legacy_parameter_queue(self):
         # This is for the unlikely scenario where only
         # the first parameter is updated
