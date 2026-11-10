@@ -147,18 +147,14 @@ class ConnectionTests(unittest.TestCase):
         self.connection.callbacks.add.assert_called_once_with(
             0, spec.Connection.UpdateSecretOk, dummy_callback)
 
-    @mock.patch('logging.Logger.critical')
-    def test_deliver_frame_to_channel_with_frame_for_unknown_channel(
-            self, critical_mock):
+    def test_deliver_frame_to_channel_with_frame_for_unknown_channel(self):
         unknown_channel_num = 99
         self.assertNotIn(unknown_channel_num, self.connection._channels)
 
         unexpected_frame = frame.Method(unknown_channel_num, mock.Mock())
-        self.connection._deliver_frame_to_channel(unexpected_frame)
-
-        critical_mock.assert_called_once_with(
-            'Received %s frame for unregistered channel %i on %s',
-            unexpected_frame.NAME, unknown_channel_num, self.connection)
+        with self.assertRaises(exceptions.UnexpectedFrameError) as ctx:
+            self.connection._deliver_frame_to_channel(unexpected_frame)
+        self.assertIs(ctx.exception.args[0], unexpected_frame)
 
     @mock.patch('pika.connection.Connection._on_close_ready')
     def test_on_channel_cleanup_with_closing_channels(self, on_close_ready):
@@ -611,6 +607,9 @@ class ConnectionTests(unittest.TestCase):
                 'exchange_exchange_bindings': False
             }
         }
+        # A Start frame is only legal in the PROTOCOL handshake stage.
+        self.connection._set_connection_state(
+            self.connection.CONNECTION_PROTOCOL)
         self.connection._adapter_emit_data = mock.Mock()
         self.connection._on_connection_start(method_frame)
         self.assertEqual(True, self.connection.basic_nack)
@@ -666,8 +665,15 @@ class ConnectionTests(unittest.TestCase):
         self.connection.params.frame_max = 20000
         self.connection.params.heartbeat = 20
 
+        # Tune is legal only in the START stage; reset before each direct call
+        # because the handler itself transitions to TUNE.
+        def call_tune():
+            self.connection._set_connection_state(
+                self.connection.CONNECTION_START)
+            self.connection._on_connection_tune(method_frame)
+
         # Test
-        self.connection._on_connection_tune(method_frame)
+        call_tune()
 
         # verify
         self.assertEqual(self.connection.CONNECTION_TUNE,
@@ -688,7 +694,7 @@ class ConnectionTests(unittest.TestCase):
         method_frame.method.heartbeat = 60
         self.connection.params.heartbeat = 20
         # Test
-        self.connection._on_connection_tune(method_frame)
+        call_tune()
         # verify
         self.assertEqual(20, self.connection.params.heartbeat)
 
@@ -696,7 +702,7 @@ class ConnectionTests(unittest.TestCase):
         method_frame.method.heartbeat = 500
         self.connection.params.heartbeat = None
         # Test
-        self.connection._on_connection_tune(method_frame)
+        call_tune()
         # verify
         self.assertEqual(500, self.connection.params.heartbeat)
 
@@ -704,7 +710,7 @@ class ConnectionTests(unittest.TestCase):
         method_frame.method.heartbeat = 60
         self.connection.params.heartbeat = 0
         # Test
-        self.connection._on_connection_tune(method_frame)
+        call_tune()
         # verify
         self.assertEqual(0, self.connection.params.heartbeat)
 
@@ -712,7 +718,7 @@ class ConnectionTests(unittest.TestCase):
         method_frame.method.heartbeat = 0
         self.connection.params.heartbeat = None
         # Test
-        self.connection._on_connection_tune(method_frame)
+        call_tune()
         # verify
         self.assertEqual(0, self.connection.params.heartbeat)
 
@@ -720,7 +726,7 @@ class ConnectionTests(unittest.TestCase):
         method_frame.method.heartbeat = 0
         self.connection.params.heartbeat = 0
         # Test
-        self.connection._on_connection_tune(method_frame)
+        call_tune()
         # verify
         self.assertEqual(0, self.connection.params.heartbeat)
 
@@ -728,7 +734,7 @@ class ConnectionTests(unittest.TestCase):
         method_frame.method.heartbeat = 0
         self.connection.params.heartbeat = 60
         # Test
-        self.connection._on_connection_tune(method_frame)
+        call_tune()
         # verify
         self.assertEqual(60, self.connection.params.heartbeat)
 
@@ -742,7 +748,7 @@ class ConnectionTests(unittest.TestCase):
         method_frame.method.heartbeat = 10
         self.connection.params.heartbeat = choose_max
         # Test
-        self.connection._on_connection_tune(method_frame)
+        call_tune()
         # verify
         self.assertEqual(60, self.connection.params.heartbeat)
 
@@ -1046,9 +1052,15 @@ class ConnectionTests(unittest.TestCase):
             self.connection.remove_on_connection_blocked_callback(cb))
         self.assertFalse(
             self.connection.remove_on_connection_blocked_callback(cb))
-        self.connection._process_frame(
-            pika.frame.Method(0, pika.spec.Connection.Blocked('reason')))
+        blocked_frame = pika.frame.Method(
+            0, pika.spec.Connection.Blocked('reason'))
+        self.connection._terminate_stream = mock.Mock()
+        self.connection._process_frame(blocked_frame)
         self.assertEqual(buffer, [])
+        # Once the handler is gone the method is no longer legal in this state,
+        # so the frame ends the connection rather than being dropped silently.
+        self._assert_unexpected_frame_termination(blocked_frame)
+        self.connection._terminate_stream.assert_called_once()
 
     def test_remove_on_connection_blocked_callback_isolation(self):
         kept, removed = [], []
@@ -1063,8 +1075,9 @@ class ConnectionTests(unittest.TestCase):
         self.connection.add_on_connection_blocked_callback(cb_remove)
         self.assertTrue(
             self.connection.remove_on_connection_blocked_callback(cb_remove))
-        self.connection._process_frame(
-            pika.frame.Method(0, pika.spec.Connection.Blocked('reason')))
+        blocked_frame = pika.frame.Method(
+            0, pika.spec.Connection.Blocked('reason'))
+        self.connection._process_frame(blocked_frame)
         self.assertEqual(len(kept), 1)
         self.assertEqual(removed, [])
 
@@ -1079,9 +1092,18 @@ class ConnectionTests(unittest.TestCase):
             self.connection.remove_on_connection_unblocked_callback(cb))
         self.assertFalse(
             self.connection.remove_on_connection_unblocked_callback(cb))
-        self.connection._process_frame(
-            pika.frame.Method(0, pika.spec.Connection.Unblocked()))
+        unblocked_frame = pika.frame.Method(0, pika.spec.Connection.Unblocked())
+        self.connection._terminate_stream = mock.Mock()
+        self.connection._process_frame(unblocked_frame)
         self.assertEqual(buffer, [])
+        self._assert_unexpected_frame_termination(unblocked_frame)
+        self.connection._terminate_stream.assert_called_once()
+
+    def _assert_unexpected_frame_termination(self, frame_value):
+        error = self.connection._terminate_stream.call_args[0][0]
+        self.assertIsInstance(error, exceptions.UnexpectedFrameError)
+        self.assertIsInstance(error, exceptions.ProtocolSyntaxError)
+        self.assertIn(repr(frame_value), repr(error))
 
     @mock.patch.object(connection.Connection,
                        '_adapter_connect_stream',

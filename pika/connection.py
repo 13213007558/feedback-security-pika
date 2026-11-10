@@ -1785,12 +1785,10 @@ class Connection(abc.ABC):
         :param value: The frame to deliver
         """
         if value.channel_number not in self._channels:
-            # This should never happen and would constitute breach of the
-            # protocol
-            LOGGER.critical(
-                'Received %s frame for unregistered channel %i on %s',
-                value.NAME, value.channel_number, self)
-            return
+            # A frame for a channel the client never opened breaches the
+            # protocol; raise so the frame-level guard ends the connection
+            # instead of logging and silently dropping it.
+            raise exceptions.UnexpectedFrameError(value)
 
         if (isinstance(value, frame.Header) and
                 value.body_size > self.params.max_inbound_message_body_size):
@@ -2022,6 +2020,11 @@ class Connection(abc.ABC):
 
         :param method_frame: Server response frame
         """
+        # The callback only exists while Connection.Open is outstanding, but a
+        # re-registered handler must still be rejected unless the handshake is
+        # waiting on exactly this reply.
+        self._require_handshake_state(self.CONNECTION_TUNE, method_frame)
+
         self._opened = True
 
         self.known_hosts = method_frame.method.known_hosts
@@ -2032,6 +2035,22 @@ class Connection(abc.ABC):
         # Call our initial callback that we're open
         self.callbacks.process(0, self.ON_CONNECTION_OPEN_OK, self, self)
 
+    def _require_handshake_state(self, expected_state: int,
+                                 method_frame: frame.Frame) -> None:
+        """Reject a handshake method whose callback exists in a state that does not allow it.
+
+        Callback registration alone proves the method class is recognized, not that it is legal at
+        the current stage. Stream termination re-registers the Connection.Start handler via
+        `_init_connection_state`, so without this guard a late or repeated frame could re-enter a
+        completed handshake and change state.
+
+        :param expected_state: The only connection state in which *method_frame* may run
+        :param method_frame: The frame the callback received
+        :raises UnexpectedFrameError: when the current state differs
+        """
+        if self.connection_state != expected_state:
+            raise exceptions.UnexpectedFrameError(method_frame)
+
     def _on_connection_start(
             self, method_frame: frame.Method[spec.Connection.Start]) -> None:
         """
@@ -2040,6 +2059,11 @@ class Connection(abc.ABC):
         :param method_frame: The frame received
         :raises UnexpectedFrameError:
         """
+        # Start is legal only before any handshake stage has run. Termination
+        # re-registers this handler, so the state check stops a duplicate or
+        # post-close Start from restarting the handshake.
+        self._require_handshake_state(self.CONNECTION_PROTOCOL, method_frame)
+
         self._set_connection_state(self.CONNECTION_START)
 
         try:
@@ -2118,6 +2142,11 @@ class Connection(abc.ABC):
 
         :param method_frame: The frame received
         """
+        # Tune is the reply to StartOk, so it runs only while the handshake is
+        # in the START stage. A Tune arriving at any other state is a protocol
+        # violation rather than a second tuning round.
+        self._require_handshake_state(self.CONNECTION_START, method_frame)
+
         self._set_connection_state(self.CONNECTION_TUNE)
 
         # Get our max channels, frames and heartbeat interval
@@ -2382,17 +2411,48 @@ class Connection(abc.ABC):
         if self._process_callbacks(frame_value):
             return
 
-        # If a heartbeat is received, update the checker
+        # A heartbeat without a checker is tolerated by the protocol.
         if frame_type == spec.FRAME_HEARTBEAT:
             if self._heartbeat_checker:
                 self._heartbeat_checker.received()
             else:
                 LOGGER.warning('Received heartbeat frame without a heartbeat '
                                'checker')
+            return
 
-        # If the frame has a channel number beyond the base channel, deliver it
-        elif frame_value.channel_number > 0:
-            self._deliver_frame_to_channel(frame_value)
+        # Nothing else may reach the stack unless the current handshake state
+        # allows it. A method with no pending callback (a repeated
+        # Connection.Start, a Connection.OpenOk before Connection.Open was
+        # sent, etc.) and any channel frame arriving before the AMQP
+        # connection is open are protocol violations, not events to ignore.
+        # The persistent Connection.Close handler is always pending, so a
+        # broker-initiated close is handled above rather than rejected here.
+        self._reject_out_of_sequence_frame(frame_value)
+
+    def _reject_out_of_sequence_frame(self, frame_value: frame.Frame) -> None:
+        """Deliver an in-order channel frame or tear down the connection over an out-of-sequence one.
+
+        A channel frame is in order only once the AMQP connection is open and the channel is
+        registered; the channel map lookup in `_deliver_frame_to_channel` merely logs frames for
+        unregistered channels, which would otherwise hide a broker sending channel data or a
+        channel-0 method out of sequence during the handshake. Both are protocol violations and end
+        the connection with the offending frame attached to the error.
+
+        :param frame_value: The frame no pending callback accepts
+        """
+        if frame_value.channel_number > 0 and self.is_open:
+            try:
+                self._deliver_frame_to_channel(frame_value)
+            except exceptions.UnexpectedFrameError:
+                # A frame for a channel the client never opened ends the
+                # connection rather than propagating out of frame processing.
+                pass
+            else:
+                return
+
+        LOGGER.error('Frame out of sequence in connection state %s: %r',
+                     self._STATE_NAMES[self.connection_state], frame_value)
+        self._terminate_stream(exceptions.UnexpectedFrameError(frame_value))
 
     def _remove_callbacks(
             self, channel_number: int,
