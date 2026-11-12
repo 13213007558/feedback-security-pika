@@ -1343,6 +1343,14 @@ class BlockingChannel:
         # Basic.Return in publisher-acknowledgments mode.
         self._puback_return: ReturnedMessage | None = None
 
+        # Delivery tag of the publish whose confirmation `basic_publish` is
+        # waiting for; None outside that wait.
+        self._expected_puback_tag: int | None = None
+
+        # Delivery tag the broker assigns to the next publish in
+        # publisher-acknowledgments mode; 1 for the first after Confirm.Select.
+        self._next_puback_tag = 1
+
         # self._on_channel_closed() saves the reason exception here
         self._closing_reason = None  # type: None | Exception
 
@@ -1446,6 +1454,34 @@ class BlockingChannel:
         if self.is_closed and isinstance(self._closing_reason,
                                          exceptions.ChannelClosedByBroker):
             raise self._closing_reason
+
+    def _on_message_confirmation_report(
+        self,
+        method_frame: pika.frame.Method[pika.spec.Basic.Ack |
+                                        pika.spec.Basic.Nack],
+    ) -> None:
+        """
+        Called as the result of Basic.Ack or Basic.Nack from broker in publisher-acknowledgements mode.
+
+        Signals the pending `basic_publish` only when the confirmation's delivery tag matches the
+        publish being waited on. A confirmation for any other tag is a duplicate the broker was not
+        expected to send; accepting it would end the current publish's wait with another publish's
+        outcome and shift every later confirmation one publish out of place.
+
+        :param method_frame: method frame carrying `pika.spec.Basic.Ack` or
+            `pika.spec.Basic.Nack`
+        """
+        method = method_frame.method
+        if (self._expected_puback_tag is None or
+                method.delivery_tag != self._expected_puback_tag or
+                self._message_confirmation_result.is_ready()):
+            LOGGER.warning(
+                'Dropping unexpected delivery confirmation: method=%r; '
+                'expected_tag=%r; channel=%s', method,
+                self._expected_puback_tag, self.channel_number)
+            return
+
+        self._message_confirmation_result.set_value_once(method_frame)
 
     def _on_puback_message_returned(self, channel: pika.channel.Channel,
                                     method: pika.spec.Basic.Return,
@@ -2387,13 +2423,19 @@ class BlockingChannel:
         if self._delivery_confirmation:
             # In publisher-acknowledgments mode
             with self._message_confirmation_result:
-                self._impl.basic_publish(exchange=exchange,
-                                         routing_key=routing_key,
-                                         body=body,
-                                         properties=properties,
-                                         mandatory=mandatory)
+                self._expected_puback_tag = self._next_puback_tag
+                self._next_puback_tag += 1
+                try:
+                    self._impl.basic_publish(exchange=exchange,
+                                             routing_key=routing_key,
+                                             body=body,
+                                             properties=properties,
+                                             mandatory=mandatory)
 
-                self._flush_output(self._message_confirmation_result.is_ready)
+                    self._flush_output(
+                        self._message_confirmation_result.is_ready)
+                finally:
+                    self._expected_puback_tag = None
                 conf_method = (
                     self._message_confirmation_result.value.method_frame.method)
 
@@ -2506,13 +2548,13 @@ class BlockingChannel:
 
         with _CallbackResult[None]() as select_ok_result:
             self._impl.confirm_delivery(
-                ack_nack_callback=self._message_confirmation_result.
-                set_value_once,
+                ack_nack_callback=self._on_message_confirmation_report,
                 callback=select_ok_result.signal_once)
 
             self._flush_output(select_ok_result.is_ready)
 
         self._delivery_confirmation = True
+        self._next_puback_tag = 1
 
         # Unroutable messages returned after this point will be in the context
         # of publisher acknowledgments

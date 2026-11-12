@@ -1,5 +1,6 @@
 """Tests for pika.adapters.blocking_connection.BlockingChannel."""
 
+import threading
 import unittest
 from collections import deque
 from unittest import mock
@@ -190,3 +191,289 @@ class BlockingChannelTests(unittest.TestCase):
             self.obj.basic_consume('queue', mock.Mock())
             self.assertEqual(1, len(self.obj.consumer_tags))
             self.assertIn('ctag0', self.obj.consumer_tags)
+
+
+class _ScriptedIoloop:
+    """Ioloop stub running one scripted broker action per `poll()`.
+
+    The real `BlockingConnection._flush_output` loop polls until a waiter is
+    ready, so each scripted step stands in for broker frames arriving from
+    the socket. Polling past the end of the script fails the test instead of
+    hanging.
+    """
+
+    def __init__(self):
+        self.steps = deque()
+
+    def poll(self):
+        assert self.steps, 'flush loop polled with no scripted broker event'
+        self.steps.popleft()()
+
+    def process_timeouts(self):
+        pass
+
+
+class BlockingChannelPubackTests(unittest.TestCase):
+    """`BlockingChannel.basic_publish` in publisher-acknowledgments mode.
+
+    Exercises the real `_flush_output` wait and callback dispatch: the
+    `BlockingChannel` and `BlockingConnection` are real, only the impl
+    channel, impl connection and ioloop are stubs, and broker frames arrive
+    through the callbacks the adapter registered.
+    """
+
+    def setUp(self):
+        self.ioloop = _ScriptedIoloop()
+        self.connection_impl_mock = mock.Mock(is_closed=False, is_open=True)
+        self.connection_impl_mock._transport = mock.Mock()
+        self.connection_impl_mock._get_write_buffer_size.return_value = 0
+        self.connection_impl_mock.ioloop = self.ioloop
+
+        self.connection = object.__new__(blocking_connection.BlockingConnection)
+        self.connection._cleanup_mutex = threading.Lock()
+        self.connection._event_dispatch_suspend_depth = 0
+        self.connection._ready_events = deque()
+        self.connection._channels_pending_dispatch = set()
+        self.connection._closed_result = blocking_connection._CallbackResult(
+            blocking_connection.BlockingConnection._OnClosedArgs)
+        self.connection._server_channel_closures = deque()
+        self.connection._impl = self.connection_impl_mock
+
+        self.channel_impl_mock = mock.Mock(spec=ChannelTemplate,
+                                           channel_number=1,
+                                           is_closing=False,
+                                           is_closed=False,
+                                           is_open=True)
+        self.channel_impl_mock.add_on_close_callback.side_effect = (
+            lambda callback: setattr(self, '_close_callback', callback))
+        self.channel_impl_mock.add_on_return_callback.side_effect = (
+            lambda callback: setattr(self, '_return_callback', callback))
+
+        self.obj = blocking_connection.BlockingChannel(self.channel_impl_mock,
+                                                       self.connection)
+
+    def tearDown(self):
+        del self.obj
+        del self.connection
+
+    def _enable_confirm(self):
+
+        def confirm_delivery(ack_nack_callback, callback):
+            self._ack_nack_callback = ack_nack_callback
+            callback()
+
+        self.channel_impl_mock.confirm_delivery.side_effect = confirm_delivery
+        self.obj.confirm_delivery()
+
+    def _broker_acks(self, delivery_tag):
+        self._ack_nack_callback(frame.Method(1, spec.Basic.Ack(delivery_tag)))
+
+    def _broker_nacks(self, delivery_tag):
+        self._ack_nack_callback(frame.Method(1, spec.Basic.Nack(delivery_tag)))
+
+    def _broker_returns(self, properties, body):
+        method = spec.Basic.Return(reply_code=312,
+                                   reply_text='NO_ROUTE',
+                                   exchange='exchange',
+                                   routing_key='routing.key')
+        self._return_callback(self.channel_impl_mock, method, properties, body)
+
+    def _broker_closes_channel(self):
+        self.channel_impl_mock.is_closed = True
+        self.channel_impl_mock.is_open = False
+        self.channel_impl_mock._raise_if_not_open.side_effect = (
+            exceptions.ChannelWrongStateError('Channel is closed.'))
+        self._close_callback(
+            self.channel_impl_mock,
+            exceptions.ChannelClosedByBroker(404, 'NOT_FOUND - no queue'))
+
+    def test_return_then_ack_raises_unroutable_with_own_message(self):
+        self._enable_confirm()
+        properties = spec.BasicProperties(content_type='text/plain',
+                                          message_id='msg-1')
+        body = b'payload-1'
+        self.ioloop.steps += [
+            lambda: self._broker_returns(properties, body),
+            lambda: self._broker_acks(1),
+        ]
+
+        with self.assertRaises(exceptions.UnroutableError) as ctx:
+            self.obj.basic_publish('exchange',
+                                   'routing.key',
+                                   body,
+                                   properties=properties,
+                                   mandatory=True)
+
+        self.assertEqual(1, len(ctx.exception.messages))
+        returned = ctx.exception.messages[0]
+        self.assertIs(returned.body, body)
+        self.assertIs(returned.properties, properties)
+        self.assertEqual(312, returned.method.reply_code)
+
+    def test_return_then_nack_raises_nack_with_returned_message(self):
+        self._enable_confirm()
+        properties = spec.BasicProperties(content_type='text/plain',
+                                          message_id='msg-1')
+        body = b'payload-1'
+        self.ioloop.steps += [
+            lambda: self._broker_returns(properties, body),
+            lambda: self._broker_nacks(1),
+        ]
+
+        with self.assertRaises(exceptions.NackError) as ctx:
+            self.obj.basic_publish('exchange',
+                                   'routing.key',
+                                   body,
+                                   properties=properties,
+                                   mandatory=True)
+
+        self.assertEqual(1, len(ctx.exception.messages))
+        returned = ctx.exception.messages[0]
+        self.assertIs(returned.body, body)
+        self.assertIs(returned.properties, properties)
+
+    def test_nack_without_return_raises_nack_without_messages(self):
+        self._enable_confirm()
+        self.ioloop.steps.append(lambda: self._broker_nacks(1))
+
+        with self.assertRaises(exceptions.NackError) as ctx:
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-1',
+                properties=spec.BasicProperties(message_id='msg-1'),
+                mandatory=True)
+
+        self.assertEqual([], ctx.exception.messages)
+
+    def test_failure_leaves_nothing_for_next_publish(self):
+        self._enable_confirm()
+        properties = spec.BasicProperties(message_id='msg-1')
+        body = b'payload-1'
+        self.ioloop.steps += [
+            lambda: self._broker_returns(properties, body),
+            lambda: self._broker_acks(1),
+        ]
+        with self.assertRaises(exceptions.UnroutableError) as ctx:
+            self.obj.basic_publish('exchange',
+                                   'routing.key',
+                                   body,
+                                   properties=properties,
+                                   mandatory=True)
+        self.assertIs(ctx.exception.messages[0].body, body)
+
+        self.ioloop.steps.append(lambda: self._broker_acks(2))
+        self.assertIsNone(
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-2',
+                properties=spec.BasicProperties(message_id='msg-2'),
+                mandatory=True))
+
+        # A success must not leave anything behind either.
+        self.ioloop.steps.append(lambda: self._broker_acks(3))
+        self.assertIsNone(
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-3',
+                properties=spec.BasicProperties(message_id='msg-3'),
+                mandatory=True))
+
+    def test_channel_close_while_waiting_for_confirmation(self):
+        self._enable_confirm()
+        properties = spec.BasicProperties(message_id='msg-1')
+        body = b'payload-1'
+        self.ioloop.steps += [
+            lambda: self._broker_returns(properties, body),
+            self._broker_closes_channel,
+        ]
+
+        with self.assertRaises(exceptions.ChannelClosedByBroker):
+            self.obj.basic_publish('exchange',
+                                   'routing.key',
+                                   body,
+                                   properties=properties,
+                                   mandatory=True)
+
+        # The interrupted publish's returned message must not surface in a
+        # later call.
+        with self.assertRaises(exceptions.ChannelWrongStateError):
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-2',
+                properties=spec.BasicProperties(message_id='msg-2'),
+                mandatory=True)
+
+    def test_duplicate_confirmation_does_not_end_wait(self):
+        self._enable_confirm()
+        self.ioloop.steps.append(lambda: self._broker_acks(1))
+        self.assertIsNone(
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-1',
+                properties=spec.BasicProperties(message_id='msg-1'),
+                mandatory=True))
+
+        # A retransmitted confirmation for delivery-tag 1 must not complete
+        # the next publish's wait; only delivery-tag 2 may.
+        properties = spec.BasicProperties(message_id='msg-2')
+        body = b'payload-2'
+        self.ioloop.steps += [
+            lambda: self._broker_acks(1),
+            lambda: self._broker_returns(properties, body),
+            lambda: self._broker_acks(2),
+        ]
+        with self.assertRaises(exceptions.UnroutableError) as ctx:
+            self.obj.basic_publish('exchange',
+                                   'routing.key',
+                                   body,
+                                   properties=properties,
+                                   mandatory=True)
+        self.assertIs(ctx.exception.messages[0].body, body)
+
+        self.ioloop.steps.append(lambda: self._broker_acks(3))
+        self.assertIsNone(
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-3',
+                properties=spec.BasicProperties(message_id='msg-3'),
+                mandatory=True))
+
+    def test_duplicate_nack_does_not_fail_next_publish(self):
+        self._enable_confirm()
+        self.ioloop.steps.append(lambda: self._broker_nacks(1))
+        with self.assertRaises(exceptions.NackError):
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-1',
+                properties=spec.BasicProperties(message_id='msg-1'),
+                mandatory=True)
+
+        self.ioloop.steps += [
+            lambda: self._broker_nacks(1),
+            lambda: self._broker_acks(2),
+        ]
+        self.assertIsNone(
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-2',
+                properties=spec.BasicProperties(message_id='msg-2'),
+                mandatory=True))
+
+    def test_without_confirm_mode_publish_does_not_wait(self):
+        # The script is empty: any wait for a broker outcome would fail.
+        self.assertIsNone(
+            self.obj.basic_publish(
+                'exchange',
+                'routing.key',
+                b'payload-1',
+                properties=spec.BasicProperties(message_id='msg-1'),
+                mandatory=True))
+        self.channel_impl_mock.basic_publish.assert_called_once()
