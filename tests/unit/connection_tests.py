@@ -1346,3 +1346,100 @@ class ConnectionTests(unittest.TestCase):
 
         # Now make sure that nothing is enqueued on frame buffer
         self.assertEqual(b'', self.connection._frame_buffer)
+
+
+class EraseOnConnectTests(unittest.TestCase):
+    """`PlainCredentials(erase_on_connect=True)` erases only the copy owned by
+    the `Connection` that consumed it. The caller's object and the
+    `ConnectionParameters` copy stay intact, so workflow retries and
+    application-level reconnects built from the same parameters still
+    authenticate.
+    """
+
+    USERNAME = 'erase-user'
+    PASSWORD = 'erase-password'
+    FULL_RESPONSE = b'\0' + USERNAME.encode() + b'\0' + PASSWORD.encode()
+
+    def setUp(self):
+        self.caller_credentials = credentials.PlainCredentials(
+            self.USERNAME, self.PASSWORD, erase_on_connect=True)
+        self.params = connection.ConnectionParameters(
+            host='node1.example', credentials=self.caller_credentials)
+
+    @staticmethod
+    def _make_connection(params):
+        conn = ConstructibleConnection(parameters=params,
+                                       internal_connection_workflow=False)
+        conn.emitted = []
+        conn._adapter_emit_data = conn.emitted.append
+        conn._adapter_call_later = lambda delay, callback: (delay, callback)
+        return conn
+
+    @staticmethod
+    def _feed_start(conn):
+        conn._process_frame(
+            frame.Method(
+                0, spec.Connection.Start(0, 9, {}, 'PLAIN AMQPLAIN', 'en_US')))
+
+    @staticmethod
+    def _start_ok_responses(conn):
+        responses = []
+        for data in conn.emitted:
+            offset = 0
+            while offset < len(data):
+                used, decoded = frame.decode_frame(data[offset:])
+                offset += used
+                if isinstance(decoded, frame.Method) and isinstance(
+                        decoded.method, spec.Connection.StartOk):
+                    responses.append(decoded.method.response)
+        return responses
+
+    def test_erase_hits_only_the_consuming_connections_copy(self):
+        conn = self._make_connection(self.params)
+        self._feed_start(conn)
+
+        self.assertEqual([self.FULL_RESPONSE], self._start_ok_responses(conn))
+        self.assertIsNone(conn.params.credentials.username)
+        self.assertIsNone(conn.params.credentials.password)
+        self.assertEqual(self.PASSWORD, self.params.credentials.password)
+        self.assertEqual(self.PASSWORD, self.caller_credentials.password)
+
+    def test_failed_handshake_does_not_consume_material_for_next_attempt(self):
+        first = self._make_connection(self.params)
+        self._feed_start(first)
+        # Broker drops the link before OpenOk; the workflow would now try the
+        # next address with the same parameters object.
+        del first
+
+        second = self._make_connection(self.params)
+        self._feed_start(second)
+
+        self.assertEqual([self.FULL_RESPONSE], self._start_ok_responses(second))
+
+    def test_reconnect_from_original_params_after_open_sends_full_response(
+            self):
+        first = self._make_connection(self.params)
+        self._feed_start(first)
+        first._process_frame(
+            frame.Method(0, spec.Connection.Tune(0, 131072, 60)))
+        first._process_frame(frame.Method(0, spec.Connection.OpenOk()))
+        self.assertEqual(connection.Connection.CONNECTION_OPEN,
+                         first.connection_state)
+
+        second = self._make_connection(self.params)
+        self._feed_start(second)
+
+        self.assertEqual([self.FULL_RESPONSE], self._start_ok_responses(second))
+
+    def test_reconnect_from_consumed_connections_params_sends_empty_response(
+            self):
+        first = self._make_connection(self.params)
+        self._feed_start(first)
+
+        # first.params is the connection-owned copy that erase_on_connect
+        # wiped; building the next connection from it authenticates with
+        # blank username and password.
+        second = self._make_connection(first.params)
+        self._feed_start(second)
+
+        self.assertEqual([b'\0\0'], self._start_ok_responses(second))

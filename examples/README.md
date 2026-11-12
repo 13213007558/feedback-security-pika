@@ -87,6 +87,7 @@ Either flag is enough on its own. `durable=True` is the usual answer; `exclusive
 | `blocking_publish_mandatory.py` | Mandatory publishing with unroutable message handling |
 | `blocking_consume_recover_multiple_hosts.py` | Connection recovery across multiple brokers |
 | `blocking_consume_recover_multiple_hosts_retry.py` | Multi-host recovery using the `retry` library |
+| `blocking_connect_multiple_hosts_erase_on_connect.py` | Multi-address failover with `erase_on_connect=True` credentials from a provider |
 | `blocking_consume_tls.py` | Blocking consumer with TLS |
 | `comparing_publishing_sync.py` | Simple synchronous publish |
 
